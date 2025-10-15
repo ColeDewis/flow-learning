@@ -1,0 +1,6 @@
+wandb
+robosuite
+robosuite-models
+torch
+hydra-core
+cmake==3.22 # robomimic seems to need this for egl_probe to install correctly.

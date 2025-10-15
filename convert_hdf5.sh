@@ -1,0 +1,27 @@
+#!/bin/bash
+
+# Usage: ./convert_hdf5.sh <dataset_path> <output_name>
+
+# Positional arguments
+DATASET_PATH=$1
+OUTPUT_NAME=$2
+
+# Check if arguments are provided
+if [ -z "$DATASET_PATH" ] || [ -z "$OUTPUT_NAME" ]; then
+    echo "Usage: $0 <dataset_path> <output_name>.hdf5"
+    exit 1
+fi
+
+cd ~/cvrg/flow-learning/robomimic/robomimic/scripts
+
+# Run the Python scripts with the provided arguments
+python3 conversion/convert_robosuite.py --dataset "$DATASET_PATH"
+python3 dataset_states_to_obs.py --dataset "$DATASET_PATH" --output_name "$OUTPUT_NAME" --done_mode 2 --camera_names agentview robot0_eye_in_hand --camera_height 84 --camera_width 84
+
+# Extract the directory of the input dataset
+OUTPUT_DIR=$(dirname "$DATASET_PATH")
+FULL_OUTPUT_PATH="$OUTPUT_DIR/$OUTPUT_NAME"
+
+# Run to show the 
+python3 get_dataset_info.py --dataset "$FULL_OUTPUT_PATH"
+echo "Conversion completed successfully! Output saved as $FULL_OUTPUT_PATH"

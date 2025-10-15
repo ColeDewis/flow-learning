@@ -1,0 +1,15 @@
+hydra:
+  job:
+    chdir: true
+
+dataset:
+  path: /home/cole/cvrg/flow-learning/demonstrations/1760487683_8887284/testdemos.hdf5
+
+training:
+  lr: 0.001
+  batch_size: 64
+  num_epochs: 100
+
+flow:
+  action_window_size: 8
+  obs_window_size: 2

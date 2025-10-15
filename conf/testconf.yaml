@@ -1,0 +1,5 @@
+hydra:
+  job:
+    chdir: true
+
+epochs: 10
