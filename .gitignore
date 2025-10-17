@@ -5,3 +5,5 @@ wandb/
 robomimic/
 __pycache__/
 notes.md
+*.pth
+MUJOCO_LOG.TXT

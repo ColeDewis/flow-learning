@@ -3,7 +3,7 @@ hydra:
     chdir: true
 
 dataset:
-  path: /home/cole/cvrg/flow-learning/demonstrations/1760487683_8887284/testdemos.hdf5
+  path: /home/coled/flow-learning/demonstrations/lift_test.hdf5
 
 training:
   lr: 0.001

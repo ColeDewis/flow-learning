@@ -17,7 +17,7 @@ import numpy as np
 import robosuite as suite
 from robosuite.controllers import load_composite_controller_config
 from robosuite.controllers.composite.composite_controller import WholeBody
-from robosuite.wrappers import DataCollectionWrapper, VisualizationWrapper
+from robosuite.wrappers import DataCollectionWrapper, VisualizationWrapper, Wrapper
 
 
 def collect_human_trajectory(env, device, arm, max_fr):
@@ -101,7 +101,12 @@ def collect_human_trajectory(env, device, arm, max_fr):
                 gripper_ac
             ]
 
-        env.step(env_action)
+        # TODO: remove this later
+        if np.allclose(env_action, np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0])):
+            Wrapper.step(env, env_action)
+        else:
+            # -- end remove --
+            env.step(env_action)
         env.render()
 
         # Also break if we complete the task
@@ -277,6 +282,7 @@ if __name__ == "__main__":
         "--renderer",
         type=str,
         default="mujoco",
+        # default="mjviewer",
         help="Use Mujoco's builtin interactive viewer (mjviewer) or OpenCV viewer (mujoco)",
     )
     parser.add_argument(
@@ -332,16 +338,20 @@ if __name__ == "__main__":
     # wrap the environment with data collection wrapper
     tmp_directory = "/tmp/{}".format(str(time.time()).replace(".", "_"))
     env = DataCollectionWrapper(env, tmp_directory)
-
     # initialize device
 
     from robosuite.devices import Keyboard
+    from robosuite.devices.mjgui import MJGUI
 
     device = Keyboard(
         env=env,
         pos_sensitivity=args.pos_sensitivity,
         rot_sensitivity=args.rot_sensitivity,
     )
+
+    # TODO write xbox controller input device for better demos
+
+    # device = MJGUI(env=env, active_end_effector=args.arm)
 
     # make a new timestamped directory
     t1, t2 = str(time.time()).split(".")

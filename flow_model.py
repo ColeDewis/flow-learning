@@ -1,5 +1,6 @@
 import math
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,7 +15,6 @@ class SinusoidalPositionEmbeddings(nn.Module):
 
     def forward(self, time: torch.Tensor) -> torch.Tensor:
         device = time.device
-
         emb = math.log(10000) / (self.half_dim - 1)
         emb = torch.exp(torch.arange(self.half_dim, device=device) * -emb)
 
@@ -70,8 +70,6 @@ class TemporalUNetBlock(nn.Module):
                 in_channels, out_channels, kernel_size=4, stride=2, padding=1
             )
 
-        # 3. FiLM and Normalization
-        # BatchNorm1d is standard for channel-first conv features
         self.norm = nn.BatchNorm1d(out_channels)
         self.act = nn.GELU()
 
@@ -86,25 +84,20 @@ class TemporalUNetBlock(nn.Module):
             x = self.sampler(x)
 
             # Skip Connection (Concatenation on the Channel dimension, dim=1)
-            # The TemporalUNet implementation must ensure sizes match before cat
             if skip_x is not None:
                 x = torch.cat([x, skip_x], dim=1)
 
-        # --- 2. First Convolution + FiLM Modulation ---
         x = self.conv1(x)
-
-        # Apply normalization: [B, D_model, T_p]
         norm_x = self.norm(x)
 
         # Apply FiLM: condition is [B, D_cond]. Features are [B, D_model, T_p]
         modulated_x = self.film(norm_x, condition)
 
-        x = self.act(x + modulated_x)  # Residual connection + Activation
+        x = self.act(x + modulated_x)
 
         x = self.conv2(x)
         x = self.act(x)
 
-        # --- 4. Encoder Specific Operations (Downsample + Skip Output) ---
         if self.use_downsample:
             # Output for skip connection
             skip_out = x
@@ -159,28 +152,41 @@ class FlowMatching(nn.Module):
     def __init__(
         self,
         action_dim: int,
-        action_window_size: int = 2,
+        robot_state_dim: int = 8,
+        action_window_size: int = 8,
         encoding_dim: int = 256,
         block_channels: list = [256, 512, 1024],
         block_depth: int = 3,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
     ):
+        """Flow matching model
+
+        Args:
+            action_dim (int): output action dimension, e.g. 6 cartesian movements + 1 gripper
+            robot_state_dim (int, optional): robot state input dim, e.g. num joints+gripper. Defaults to 8.
+            action_window_size (int, optional): number of actions to predict. Defaults to 8.
+            encoding_dim (int, optional): dimension to encode images and robot state to. Defaults to 256.
+            block_channels (list, optional): UNet block sizes; last is bottleneck size. Defaults to [256, 512, 1024].
+            block_depth (int, optional): number of conv1d blocks in a unet layer. Defaults to 3.
+            device (str, optional): torch device. Defaults to "cuda" if torch.cuda.is_available() else "cpu".
+        """
         # TODO: probably this is a UNet, transformer unet? Look at examples.
         super(FlowMatching, self).__init__()
         self.action_dim = action_dim
+        self.robot_state_dim = robot_state_dim
         self.device = device
         self.action_window_size = action_window_size
         self.encoding_dim = encoding_dim
 
         # --- OBSERVATION ENCODINGS
         # resnet-18 image encoder, as in diffusion policy.
-        resnet = resnet18(pretrained=True)  # NOTE: DP uses untrained
+        resnet = resnet18(pretrained=False)  # NOTE: DP uses untrained
         self.image_encoder = nn.Sequential(
             *list(resnet.children())[:-1],
             nn.Flatten(),
         )
         self.joint_encoder = nn.Sequential(
-            nn.Linear(action_dim, 256),
+            nn.Linear(self.robot_state_dim, 256),
             nn.GELU(),
             nn.Linear(256, 512),
         )
@@ -251,28 +257,78 @@ class FlowMatching(nn.Module):
 
     @torch.no_grad()
     def infer(self, obs, delta):
+        """Infer an action given an observation by integrating the vector field.
+
+        Args:
+            obs (dict): observation data
+            delta (dict): time step for approximate forward euler integration
+
+        Returns:
+            tensor: predicted action, size (1, action_window_size, action_dim)
+        """
         # forward euler integration, with delta step size.
-        action = torch.normal(0, 1, size=(self.action_dim,))
-        for _ in range(0, 1, delta):
-            action = action + delta * self.forward(action, obs)
+        action = torch.normal(
+            0,
+            1,
+            size=(self.action_window_size, self.action_dim),
+            device=self.device,
+            dtype=torch.float32,
+        ).unsqueeze(0)
+
+        for tau in np.arange(0, 1, delta):
+            tau_tensor = torch.tensor([tau], device=self.device, dtype=torch.float32)
+            step = self.predict_vector(action, obs, tau_tensor)
+
+            # TODO: papers have add here, though to me minus makes sense and also works..
+            action = action - delta * step
 
         return action
 
     def sample_noise(self, shape):
+        """Sample gaussian noise
+
+        Args:
+            shape (tuple): shape of the noise tensor
+
+        Returns:
+            tensor: noise tensor
+        """
         return torch.normal(0, 1, size=shape, device=self.device)
 
     def noise_action(self, action, noise, tau):
+        """Apply noise to an action via linear interpolation at a given time tau
+
+        Args:
+            action (tensor): original action
+            noise (tensor): gaussian noise tensor to apply
+            tau (tensor): time step for interpolation; 0 is full noise, 1 is full action
+
+        Returns:
+            tensor: interpolated action
+        """
         # linearly interpolate between distribution of actions and noise
         tau = tau.unsqueeze(-1).unsqueeze(-1)  # Shape: (B, 1, 1)
         return tau * action + (1 - tau) * noise
 
-    def predict(self, noisy_action, obs, tau):
+    def predict_vector(self, noisy_action, obs, tau):
+        """Predict the vector from noise to action for a noisy action, observation, and time step
 
-        # TODO: test training. I'm not entirely sure the UNet is setup correctly,
-        # since I had a lot of size issues.
+        This is the main "forward" pass through the UNet.
 
+        Args:
+            noisy_action (tensor): noisy action input
+            obs (dict): observation data
+            tau (tensor): time step for interpolation
+
+        Returns:
+            tensor: predicted vector field
+        """
         images = obs["images"]
         joints = obs["joints"]
+        gripper = obs["gripper"]
+        if gripper.dim() != joints.dim():
+            gripper = gripper.unsqueeze(-1)
+        joints = torch.cat([joints, gripper], dim=-1)
 
         images = images.permute(0, 1, 4, 2, 3)  # (B, T_o, C, H, W)
 
@@ -325,6 +381,16 @@ class FlowMatching(nn.Module):
         return predicted_vector
 
     def forward(self, action, obs, tau=None):
+        """Run a forward pass to predict the vector field and compute loss
+
+        Args:
+            action (tensor): original action
+            obs (dict): observation data
+            tau (tensor, optional): time step for interpolation. If none, sampled uniformly (for training)
+
+        Returns:
+            Tuple: (predicted vector field, loss)
+        """
         if tau is None:
             # for now uniform distn; pi0 uses beta.
             tau = torch.rand(action.shape[0], device=self.device)
@@ -332,10 +398,10 @@ class FlowMatching(nn.Module):
         noise = self.sample_noise(shape=action.shape)
         target = noise - action  # eps - A_t
 
-        print(action.shape, noise.shape, target.shape, tau.shape)
+        # print(action.shape, noise.shape, target.shape, tau.shape)
         noisy_action = self.noise_action(action, noise=noise, tau=tau)
 
-        pred = self.predict(noisy_action, obs, tau)
+        pred = self.predict_vector(noisy_action, obs, tau)
 
         # loss is MSE between predicted vector field and target
         loss = F.mse_loss(pred, target)
