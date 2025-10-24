@@ -17,6 +17,7 @@ import numpy as np
 import robosuite as suite
 from robosuite.controllers import load_composite_controller_config
 from robosuite.controllers.composite.composite_controller import WholeBody
+from robosuite.utils.placement_samplers import UniformRandomSampler
 from robosuite.wrappers import DataCollectionWrapper, VisualizationWrapper, Wrapper
 
 
@@ -107,6 +108,7 @@ def collect_human_trajectory(env, device, arm, max_fr):
         else:
             # -- end remove --
             env.step(env_action)
+        # print(env_action)
         env.render()
 
         # Also break if we complete the task
@@ -316,6 +318,18 @@ if __name__ == "__main__":
     if "TwoArm" in args.environment:
         config["env_configuration"] = args.config
 
+    # override the cube to appear in a wider variety of places.
+    cube_initializer = UniformRandomSampler(
+        name="ObjectSampler",
+        x_range=[-0.1, 0.1],
+        y_range=[-0.1, 0.1],
+        rotation=None,
+        ensure_object_boundary_in_range=False,
+        ensure_valid_placement=True,
+        reference_pos=np.array((0, 0, 0.8)),
+        z_offset=0.01,
+    )
+
     # Create environment
     env = suite.make(
         **config,
@@ -327,6 +341,7 @@ if __name__ == "__main__":
         use_camera_obs=False,
         reward_shaping=True,
         control_freq=20,
+        placement_initializer=cube_initializer,
     )
 
     # Wrap this with visualization wrapper
@@ -343,11 +358,14 @@ if __name__ == "__main__":
     from robosuite.devices import Keyboard
     from robosuite.devices.mjgui import MJGUI
 
-    device = Keyboard(
-        env=env,
-        pos_sensitivity=args.pos_sensitivity,
-        rot_sensitivity=args.rot_sensitivity,
-    )
+    # device = Keyboard(
+    #     env=env,
+    #     pos_sensitivity=args.pos_sensitivity,
+    #     rot_sensitivity=args.rot_sensitivity,
+    # )
+    from xbox_controller import XboxControllerDevice
+
+    device = XboxControllerDevice(env=env)
 
     # TODO write xbox controller input device for better demos
 
@@ -362,3 +380,4 @@ if __name__ == "__main__":
     while True:
         collect_human_trajectory(env, device, args.arm, args.max_fr)
         gather_demonstrations_as_hdf5(tmp_directory, new_dir, env_info)
+        device._grasp_state = False  # reset grasp state after each demo

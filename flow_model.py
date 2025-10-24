@@ -70,7 +70,7 @@ class TemporalUNetBlock(nn.Module):
                 in_channels, out_channels, kernel_size=4, stride=2, padding=1
             )
 
-        self.norm = nn.BatchNorm1d(out_channels)
+        self.norm = nn.GroupNorm(num_groups=8, num_channels=out_channels)
         self.act = nn.GELU()
 
         self.film = FiLM(in_dim=out_channels, condition_dim=cond_dim)
@@ -152,11 +152,14 @@ class FlowMatching(nn.Module):
     def __init__(
         self,
         action_dim: int,
+        obs_window_size: int = 2,
         robot_state_dim: int = 8,
         action_window_size: int = 8,
         encoding_dim: int = 256,
+        # block_channels: list = [256, 512, 1024, 2048],
         block_channels: list = [256, 512, 1024],
         block_depth: int = 3,
+        image_input: bool = True,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
     ):
         """Flow matching model
@@ -177,6 +180,8 @@ class FlowMatching(nn.Module):
         self.device = device
         self.action_window_size = action_window_size
         self.encoding_dim = encoding_dim
+        self.obs_window_size = obs_window_size
+        self.image_input = image_input
 
         # --- OBSERVATION ENCODINGS
         # resnet-18 image encoder, as in diffusion policy.
@@ -190,10 +195,16 @@ class FlowMatching(nn.Module):
             nn.GELU(),
             nn.Linear(256, 512),
         )
-        self.observation_aggregator = CrossAttentionAggregator(
-            feature_dim=512, num_heads=4
+        self.object_encoder = nn.Sequential(
+            nn.Linear(10, 512),
+            nn.GELU(),
+            nn.Linear(512, 512),
         )
-        self.obs_resize = nn.Linear(512, self.encoding_dim // 2)
+        # self.observation_aggregator = CrossAttentionAggregator(
+        #     feature_dim=512, num_heads=4
+        # )
+        # self.obs_resize = nn.Linear(512, self.encoding_dim // 2)
+        self.obs_resize = nn.Linear(1024 * self.obs_window_size, self.encoding_dim // 2)
         # --- End
 
         self.time_embedding = SinusoidalPositionEmbeddings(dim=self.encoding_dim // 2)
@@ -326,27 +337,42 @@ class FlowMatching(nn.Module):
         images = obs["images"]
         joints = obs["joints"]
         gripper = obs["gripper"]
+        object_pos = obs["object"]
+
         if gripper.dim() != joints.dim():
             gripper = gripper.unsqueeze(-1)
         joints = torch.cat([joints, gripper], dim=-1)
 
-        images = images.permute(0, 1, 4, 2, 3)  # (B, T_o, C, H, W)
+        # images = images.permute(0, 1, 4, 2, 3)  # (B, T_o, C, H, W)
 
         # reshape observations for encoders
-        B, T_o = images.shape[:2]
-        images = images.reshape(
-            B * T_o, images.shape[2], images.shape[3], images.shape[4]
-        )  # (B*T_o, C, H, W)
+        B, T_o = joints.shape[:2]
         joints = joints.reshape(B * T_o, -1)  # (B*T_o, joint_dim)
-        img_enc = self.image_encoder(images)  # (B*T_o, 512)
         joint_enc = self.joint_encoder(joints)  # (B*T_o, 512)
 
-        # combine the image and joint encodings, and reshape to observation sequence
-        fused_features = img_enc + joint_enc  # (B*T_o, 512)
-        fused_features = fused_features.view(B, T_o, -1)
+        if self.image_input:
+            # (B*T_o, C, H, W)
+            images = images.reshape(
+                B * T_o, images.shape[2], images.shape[3], images.shape[4]
+            )
+            img_enc = self.image_encoder(images)  # (B*T_o, 512)
 
-        # fuse the entire observation sequence with cross-attention
-        observation_vec = self.observation_aggregator(fused_features)  # (B, 512)
+            object_obs_enc = img_enc
+        else:
+            object_enc = self.object_encoder(object_pos)  # (B*T_o, 512)
+            object_obs_enc = object_enc
+
+        # concatenate entire observation sequence
+        object_obs_enc = object_obs_enc.view(B, T_o, -1)
+        joint_enc = joint_enc.view(B, T_o, -1)
+        fused_features = torch.cat(
+            [object_obs_enc, joint_enc], dim=-1
+        )  # (B, T_o, 1024)
+        fused_features = fused_features.reshape(B, -1)  # (B, 1024)
+        observation_vec = fused_features
+
+        # OLD: fuse the entire observation sequence with cross-attention
+        # observation_vec = self.observation_aggregator(fused_features)  # (B, 512)
         observation_vec = self.obs_resize(observation_vec)  # (B, 256)
 
         # get sinusoidal position embeddings for time step
