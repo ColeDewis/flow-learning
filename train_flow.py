@@ -1,6 +1,8 @@
 import pickle
 
+import cv2
 import hydra
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -24,6 +26,7 @@ def prepare_batch(
     obs_window_size: int,
     device: torch.device,
     has_actions=True,
+    inference=False,
 ) -> dict:
     """Processes the batch from robomimic into a nicer form by normalizing images
     and organizing to have nicer keys for the model.
@@ -32,8 +35,6 @@ def prepare_batch(
         batch (dict): batch of data from the data loader
         obs_window_size (int): size of the observation window
         device (torch.device): device to which the tensors should be moved
-        img_mean (Tensor): mean values for image normalization
-        img_std (Tensor): standard deviation values for image normalization
 
     Returns:
         dict: processed batch
@@ -41,14 +42,27 @@ def prepare_batch(
     for key in batch["obs"].keys():
         if "image" in key:
             batch["obs"][key] = ObsUtils.batch_image_hwc_to_chw(batch["obs"][key])
+            # get rid of their image normalization to do it later.
+            normalization_stats[key]["offset"] = np.zeros_like(
+                normalization_stats[key]["offset"]
+            )
+            normalization_stats[key]["scale"] = np.ones_like(
+                normalization_stats[key]["scale"]
+            )
         batch["obs"][key] = batch["obs"][key].float()
 
-    # TODO: maybe this is normalizing wrong?? my val loss goes very bad after adding this,
-    # which is really strange.
     ObsUtils.normalize_dict(batch["obs"], normalization_stats=normalization_stats)
+
     batch["obs"]["images"] = batch["obs"].pop("agentview_image")
+
+    # scale to [-1, 1]
+    batch["obs"]["images"] = (batch["obs"]["images"] / 255.0) * 2.0 - 1.0
+
     batch["obs"]["joints"] = batch["obs"].pop("robot0_joint_pos")
     batch["obs"]["gripper"] = batch["obs"].pop("robot0_gripper_qpos")[:, :, 0]
+
+    # TODO: try normalization to [-1, 1] by dividing by 255 then -1 * 2.
+    # TODO: could consider adding a small random crop to the images
 
     # grab correct windows
     batch["obs"]["images"] = (
@@ -90,8 +104,8 @@ def train(cfg: DictConfig) -> None:
         obs_window_size=obs_window_size,
         action_dim=action_dim,
         action_window_size=action_window_size,
-        # image_input=True,
-        image_input=False,
+        image_input=True,
+        # image_input=False,
     )
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
@@ -151,7 +165,7 @@ def train(cfg: DictConfig) -> None:
         filter_by_attribute="train",
         hdf5_normalize_obs=True,
         load_next_obs=False,
-        hdf5_cache_mode="all",  # "all" crashes with too many demos
+        hdf5_cache_mode="all",
         # demo_limit=50,
     )
     valid_dataset = SequenceDataset(
@@ -190,7 +204,6 @@ def train(cfg: DictConfig) -> None:
 
     train_loader = DataLoader(
         dataset=train_dataset,
-        sampler=None,  # no custom sampling logic (uniform sampling)
         batch_size=batch_size,
         shuffle=True,
         num_workers=0,
@@ -198,12 +211,48 @@ def train(cfg: DictConfig) -> None:
     )
     valid_loader = DataLoader(
         dataset=valid_dataset,
-        sampler=None,  # no custom sampling logic (uniform sampling)
         batch_size=batch_size,
-        shuffle=False,
+        # shuffle=False,
+        shuffle=True,
         num_workers=0,
         drop_last=True,  # don't provide last batch in dataset pass if it's less than 100 in size
     )
+
+    # visualize the data loaders
+    # print(train_dataset.n_demos, valid_dataset.n_demos)
+    # data1 = train_dataset[0]
+    # data2 = valid_dataset[0]
+    # imgs1 = data1["obs"]["agentview_image"]
+    # imgs2 = data2["obs"]["agentview_image"]
+    # import cv2
+
+    # for i in range(imgs1.shape[0]):
+    #     img = imgs1[i]
+    #     img = (img).astype("uint8")
+    #     cv2.imshow("img", img)
+    #     cv2.waitKey(0)
+
+    # print("VALID")
+    # for i in range(imgs2.shape[0]):
+    #     img = imgs2[i]
+    #     img = (img).astype("uint8")
+    #     cv2.imshow("img", img)
+    #     cv2.waitKey(0)
+
+    # import cv2
+
+    # # dataloaders look fine...
+    # for i, data in enumerate(train_loader):
+    #     imgs = data["obs"]["agentview_image"]
+    #     for j in range(imgs.shape[0]):
+    #         img = imgs[j]
+    #         for k in range(img.shape[0]):
+    #             im = img[k]
+    #             im = im.numpy().astype("uint8")
+    #             print(np.min(im), np.max(im), np.mean(im))
+    #             cv2.imshow("img", im)
+    #             cv2.waitKey(0)
+    # exit()
 
     # so with seq_length=2 and frame_stack=2, we have:
     # actions [s-1, s, s+1]
@@ -232,7 +281,7 @@ def train(cfg: DictConfig) -> None:
                     normalization_stats, batch, obs_window_size, device
                 )
 
-                preds, loss = model.forward(batch["actions"], batch["obs"])
+                preds, loss, debug = model.forward(batch["actions"], batch["obs"])
                 # print("PREDICTIONS:", preds.shape)
                 loss.backward()
                 optimizer.step()
@@ -247,16 +296,19 @@ def train(cfg: DictConfig) -> None:
                 batch = prepare_batch(
                     normalization_stats, batch, obs_window_size, device
                 )
-                preds, loss = model.forward(batch["actions"], batch["obs"])
+                preds, loss, debug = model.forward(batch["actions"], batch["obs"])
                 val_loss += loss.item()
 
             # sample inference
-            batch["obs"]["images"] = batch["obs"]["images"][0].unsqueeze(0)
-            batch["obs"]["joints"] = batch["obs"]["joints"][0].unsqueeze(0)
-            batch["obs"]["gripper"] = batch["obs"]["gripper"][0].unsqueeze(0)
-            batch["obs"]["object"] = batch["obs"]["object"][0].unsqueeze(0)
-            example_pred = model.infer(batch["obs"], delta=0.1)
+            r_sample = np.random.randint(0, batch["obs"]["images"].shape[0])
+            batch["obs"]["images"] = batch["obs"]["images"][r_sample].unsqueeze(0)
+            batch["obs"]["joints"] = batch["obs"]["joints"][r_sample].unsqueeze(0)
+            batch["obs"]["gripper"] = batch["obs"]["gripper"][r_sample].unsqueeze(0)
+            batch["obs"]["object"] = batch["obs"]["object"][r_sample].unsqueeze(0)
+            example_pred, debug = model.infer(batch["obs"], delta=0.1)
             print("Example Inference Action:", example_pred[0, 0])
+            example_kp = debug["img_kp"][0].cpu().numpy()
+            # print("Example Keypoints:", [round(x, 2) for x in example_kp.tolist()])
 
         val_loss /= len(valid_loader)
         print(f"Epoch {epoch+1}/{num_epochs} - Validation Loss: {val_loss:.4f}")
@@ -268,6 +320,23 @@ def train(cfg: DictConfig) -> None:
 
         if (epoch + 1) % save_freq == 0:
             torch.save(model.state_dict(), f"flow_epoch_{epoch+1}.pth")
+
+            # visualize keypoints on an example image from the validation set
+            # example_im = batch["obs"]["images"][0, 0]  # first image in the window
+            # example_im = example_im.cpu().numpy()
+            # example_im = np.ascontiguousarray(example_im.transpose(1, 2, 0))
+            # example_im = ((example_im + 1) / 2) * 255
+            # example_im = example_im.astype(np.uint8)
+            # img_h, img_w, _ = example_im.shape
+            # example_kp = debug["img_kp"][0].cpu().numpy()
+            # n_keypoints = len(example_kp) // 2
+            # all_kp_x = example_kp[:n_keypoints]
+            # all_kp_y = example_kp[n_keypoints:]
+            # for k in range(n_keypoints):
+            #     kp_x = int((all_kp_x[k] + 1) / 2 * img_w)
+            #     kp_y = int((all_kp_y[k] + 1) / 2 * img_h)
+            #     example_im = cv2.circle(example_im, (kp_x, kp_y), 2, (0, 255, 0), -1)
+            # cv2.imwrite(f"keypoints_epoch_{epoch+1}.png", example_im)
 
         scheduler.step()
         run.log(

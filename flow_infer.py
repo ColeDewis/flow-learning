@@ -1,6 +1,7 @@
 import faulthandler
 import pickle
 
+import cv2
 import hydra
 import numpy as np
 import robosuite as suite
@@ -73,8 +74,8 @@ def main(cfg: DictConfig) -> None:
         renderer="mujoco",
         use_camera_obs=True,
         camera_names=["agentview"],
-        camera_heights=224,
-        camera_widths=224,
+        camera_heights=84,
+        camera_widths=84,
         has_renderer=True,
         has_offscreen_renderer=True,
         render_camera="agentview",
@@ -88,21 +89,38 @@ def main(cfg: DictConfig) -> None:
     obs = env.reset()
 
     model = FlowMatching(
-        action_dim=action_dim, action_window_size=action_window_size, image_input=False
+        action_dim=action_dim, action_window_size=action_window_size, image_input=True
     )
     # DIR = "/home/coled/flow-learning/outputs/2025-10-22/08-52-39"
     # DIR = "/home/coled/flow-learning/outputs/2025-10-21/16-55-38"
     # DIR = "/home/coled/flow-learning/outputs/2025-10-22/16-37-42"
     # DIR = "/home/coled/flow-learning/outputs/2025-10-23/RAW_OBJECT_TEST"
-    DIR = "/home/coled/flow-learning/outputs/2025-10-23/19-24-55"
+    # DIR = "/home/coled/flow-learning/outputs/2025-10-23/19-24-55"  # OBJECT POSITIONS
+    # DIR = "/home/coled/flow-learning/outputs/2025-10-23/16-30-55"  # IMAGES
+    # DIR = "/home/coled/flow-learning/outputs/2025-10-24/15-52-57"
+    # DIR = "/home/coled/flow-learning/outputs/2025-10-29/12-10-49"
+    # DIR = "/home/coled/flow-learning/outputs/2025-10-31/14-23-16"  # has up to 1k epochs
+    # DIR = "/home/coled/flow-learning/outputs/2025-11-03/09-53-22"
+    # DIR = "/home/coled/flow-learning/outputs/2025-11-03/10-22-40"  # TRAINED ON ONLY IMAGES
+    # DIR = "/home/coled/flow-learning/outputs/2025-11-03/11-20-25"  # new image normalization
+    # DIR = "/home/coled/flow-learning/outputs/2025-11-03/14-08-17"  # new image normalization, with state
+    # DIR = "/home/coled/flow-learning/outputs/2025-11-05/09-09-15"  # DINO
+    # DIR = (
+    #     "/home/coled/flow-learning/outputs/2025-11-05/14-36-50"  # visualization testing
+    # )
+    DIR = "/home/coled/flow-learning/outputs/2025-11-06/16-40-34"
 
-    model.load_state_dict(torch.load(f"{DIR}/flow_epoch_200.pth"))
+    model.load_state_dict(torch.load(f"{DIR}/flow_epoch_25.pth"))
     with open(f"{DIR}/normalization_stats.pkl", "rb") as f:
         normalization_stats = pickle.load(f)
     with open(f"{DIR}/action_normalization_stats.pkl", "rb") as f:
         action_normalization_stats = pickle.load(f)
-    # model.load_state_dict(torch.load("../../../flow_epoch_1000.pth"))
     model.eval()
+
+    # count params of model
+    # About 65M
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print("MODEL PARAMETERS:", total_params / 1e6, "million")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -115,9 +133,10 @@ def main(cfg: DictConfig) -> None:
             Resize((84, 84)),  # Resize to 224x224
         ]
     )
+    success = False
     for step in range(1000):
         current_obs = {
-            "images": transform(obs["agentview_image"]).permute(1, 2, 0),
+            "images": transform(obs["agentview_image"]).permute(1, 2, 0).numpy(),
             "joints": np.concatenate(
                 [
                     obs["robot0_joint_pos"],
@@ -136,7 +155,9 @@ def main(cfg: DictConfig) -> None:
             obs, reward, done, info = env.step(action)
             env.render()
         else:
-            images = np.stack([h["images"] for h in obs_history])
+            # NOTE images upside down so flipping...
+            images = np.stack([cv2.flip(h["images"], 0) for h in obs_history])
+            images = images * 255.0  # to [0, 255] range
             joints = np.stack([h["joints"] for h in obs_history])
             grippers = np.stack([h["gripper"] for h in obs_history])
             objects = np.stack([h["object"] for h in obs_history])
@@ -168,31 +189,28 @@ def main(cfg: DictConfig) -> None:
                 has_actions=False,
             )
 
-            # obs_tensor = {
-            #     "images": torch.tensor(images, dtype=torch.float32)
-            #     .unsqueeze(0)
-            #     .to(device),
-            #     "joints": torch.tensor(joints, dtype=torch.float32)
-            #     .unsqueeze(0)
-            #     .to(device),
-            #     "gripper": torch.tensor(grippers, dtype=torch.float32)
-            #     .unsqueeze(0)
-            #     .to(device),
-            # }
-
-            # mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(
-            #     1, 1, 1, 1, 3
-            # )
-            # std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 1, 1, 1, 3)
-            # obs_tensor["images"] = ((obs_tensor["images"] / 255) - mean) / std
-
-            # obs_tensor["images"] = obs_tensor["images"].permute(
-            #     0, 1, 4, 2, 3
-            # )  # to N T C H W
-            # print(obs_tensor["images"].shape)
-
             with torch.no_grad():
-                action = model.infer(obs_tensor["obs"], delta=0.1)
+                action, debug = model.infer(obs_tensor["obs"], delta=0.1)
+
+            # keypoints = debug["img_kp"].cpu().numpy()
+
+            # visualize
+            # img = images[0] * 255
+            # img = np.ascontiguousarray(img)
+            # img = img.astype(np.uint8)
+            # print(np.min(img), np.max(img), np.mean(img))
+
+            # img_h, img_w, _ = img.shape
+
+            # n_keypoints = keypoints.shape[1] // 2
+            # all_kp_x = keypoints[0, :n_keypoints]
+            # all_kp_y = keypoints[0, n_keypoints:]
+            # for k in range(n_keypoints):
+            #     kp_x = int((all_kp_x[k] + 1) / 2 * img_w)
+            #     kp_y = int((all_kp_y[k] + 1) / 2 * img_h)
+            #     img = cv2.circle(img, (kp_x, kp_y), 2, (0, 255, 0), -1)
+            # cv2.imshow("Keypoints", img)
+            # cv2.waitKey(0)
 
             scale = action_normalization_stats["actions"]["scale"]
             offset = action_normalization_stats["actions"]["offset"]
@@ -211,10 +229,14 @@ def main(cfg: DictConfig) -> None:
                 action_i = np.clip(action_i, env.action_spec[0], env.action_spec[1])
                 action_i[3:6] = 0.0  # zero out rotation for simplicity
                 obs, reward, done, info = env.step(action_i)
+                success = env._check_success()
+
                 env.render()
 
-        if done:
+        if success:
             obs = env.reset()
+
+    env.close()
 
 
 if __name__ == "__main__":

@@ -7,9 +7,9 @@ dataset:
 
 training:
   lr: 0.0001
-  batch_size: 172
-  num_epochs: 1000
-  save_freq: 100
+  batch_size: 216
+  num_epochs: 300
+  save_freq: 25
 
 flow:
   action_window_size: 8

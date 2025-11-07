@@ -5,6 +5,96 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import resnet18
+from torchvision.transforms import Resize
+
+
+class DinoEncoder(nn.Module):
+    def __init__(
+        self, output_dim, device="cuda" if torch.cuda.is_available() else "cpu"
+    ):
+        super(DinoEncoder, self).__init__()
+        self.dinov2 = (
+            torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")  # vitb14
+            .eval()
+            .to(device)
+        )
+        self.patch_size = 14  # DINOv2 patch size
+        self.dino_embed_dim = 384  # DINOv2 embed dim
+        self.input_size = 224
+
+        for param in self.dinov2.parameters():
+            param.requires_grad = False
+
+        self.projection = nn.Conv2d(
+            in_channels=self.dino_embed_dim,
+            out_channels=output_dim,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+        )
+
+    def forward(self, image):
+        resized_images = F.interpolate(
+            image,
+            size=(self.input_size, self.input_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        dino_image = self.dinov2.get_intermediate_layers(
+            resized_images, n=1, reshape=True, return_class_token=False
+        )[0]
+
+        projected_im = self.projection(dino_image)
+
+        return projected_im
+
+
+# Trying the LeRobot version now but it seems same.
+class SpatialSoftmax(nn.Module):
+    def __init__(self, height: int, width: int, in_channel: int, n_keypoints: int):
+        """
+        Spatial Softmax layer to extract spatial features from feature maps.
+
+        Args:
+            height (int): Height of the feature map.
+            width (int): Width of the feature map.
+            in_channel (int): Number of channels in the feature map.
+            n_keypoints (int): Number of keypoints to extract.
+        """
+        super(SpatialSoftmax, self).__init__()
+        self.height = height
+        self.width = width
+        self.in_channel = in_channel
+        self.n_keypoints = n_keypoints
+
+        self.channel_reduction = nn.Conv2d(
+            in_channels=in_channel, out_channels=n_keypoints, kernel_size=1
+        )
+
+        # ref: https://github.com/alexander-soare/lerobot/blob/72f402d44b9bb13cde5828b68c2b5324ef2f3051/lerobot/common/policies/diffusion/modeling_diffusion.py#L353
+        pos_x, pos_y = np.meshgrid(
+            np.linspace(-1.0, 1.0, self.width), np.linspace(-1.0, 1.0, self.height)
+        )
+        pos_x = torch.from_numpy(pos_x.reshape(self.height * self.width, 1)).float()
+        pos_y = torch.from_numpy(pos_y.reshape(self.height * self.width, 1)).float()
+        # register as buffer so it's moved to the correct device.
+        self.register_buffer("pos_grid", torch.cat([pos_x, pos_y], dim=1))
+
+    def forward(self, feature_map):
+        """Forward pass for spatial softmax."""
+
+        feature_map = self.channel_reduction(feature_map)
+        B, K, H, W = feature_map.shape
+
+        # Flatten spatial dimensions, softmax
+        feature_map = feature_map.view(B * K, H * W)  # (B, C, H * W)
+        softmax_attention = F.softmax(feature_map, dim=-1)
+
+        expected_xy = softmax_attention @ self.pos_grid
+
+        feature_keypoints = expected_xy.view(B, self.n_keypoints * 2)
+
+        return feature_keypoints
 
 
 class SinusoidalPositionEmbeddings(nn.Module):
@@ -185,11 +275,30 @@ class FlowMatching(nn.Module):
 
         # --- OBSERVATION ENCODINGS
         # resnet-18 image encoder, as in diffusion policy.
-        resnet = resnet18(pretrained=False)  # NOTE: DP uses untrained
-        self.image_encoder = nn.Sequential(
-            *list(resnet.children())[:-1],
-            nn.Flatten(),
-        )
+        resnet = resnet18(norm_layer=lambda c: nn.GroupNorm(8, c), pretrained=False)
+        # NOTE: below print confirmed they're actually groupnorms.
+        # for name, module in resnet.named_modules():
+        #     print(f"{name}: {type(module)}")
+        # ABOVE GIVES 3x3, which is fine from Dylan. we can make it larger if needed below
+        # resnet.maxpool = nn.Identity()
+        # for layer_name in ["layer3", "layer4"]:
+        #     layer = getattr(resnet, layer_name)
+        #     for block in layer:
+        #         if isinstance(block.downsample, nn.Sequential):
+        #             # Modify the stride in the downsample convolution
+        #             block.downsample[0].stride = (1, 1)
+        #         block.conv1.stride = (1, 1)
+
+        n_kp = 16
+        dino = DinoEncoder(output_dim=n_kp, device=self.device)
+
+        # self.image_encoder = nn.Sequential(
+        #     *list(resnet.children())[:-2],
+        #     SpatialSoftmax(height=3, width=3, in_channel=512, n_keypoints=n_kp),
+        # )
+        # self.image_encoder = nn.Sequential(dino, SpatialSoftmax(6, 6, n_kp, n_kp))
+        self.image_encoder = nn.Sequential(*list(resnet.children())[:-1], nn.Flatten())
+        self.keypoint_scaler = nn.Linear(n_kp * 2, 512)
         self.joint_encoder = nn.Sequential(
             nn.Linear(self.robot_state_dim, 256),
             nn.GELU(),
@@ -203,7 +312,9 @@ class FlowMatching(nn.Module):
         # self.observation_aggregator = CrossAttentionAggregator(
         #     feature_dim=512, num_heads=4
         # )
-        # self.obs_resize = nn.Linear(512, self.encoding_dim // 2)
+        # IMAGES ONLY:
+        # self.obs_resize = nn.Linear(512 * self.obs_window_size, self.encoding_dim // 2)
+        # IMAGES AND ROBOT STATE:
         self.obs_resize = nn.Linear(1024 * self.obs_window_size, self.encoding_dim // 2)
         # --- End
 
@@ -288,12 +399,13 @@ class FlowMatching(nn.Module):
 
         for tau in np.arange(0, 1, delta):
             tau_tensor = torch.tensor([tau], device=self.device, dtype=torch.float32)
-            step = self.predict_vector(action, obs, tau_tensor)
+            step, debug = self.predict_vector(action, obs, tau_tensor)
 
             # TODO: papers have add here, though to me minus makes sense and also works..
             action = action - delta * step
 
-        return action
+        # obs _should_ be same for all steps so we can return only one debug
+        return action, debug
 
     def sample_noise(self, shape):
         """Sample gaussian noise
@@ -355,8 +467,9 @@ class FlowMatching(nn.Module):
             images = images.reshape(
                 B * T_o, images.shape[2], images.shape[3], images.shape[4]
             )
-            img_enc = self.image_encoder(images)  # (B*T_o, 512)
-
+            img_kp = self.image_encoder(images)  # (B*T_o, n_kp * 2)
+            # img_enc = self.keypoint_scaler(img_kp)  # (B*T_o, 512)
+            img_enc = img_kp  # no softmax test
             object_obs_enc = img_enc
         else:
             object_enc = self.object_encoder(object_pos)  # (B*T_o, 512)
@@ -368,12 +481,12 @@ class FlowMatching(nn.Module):
         fused_features = torch.cat(
             [object_obs_enc, joint_enc], dim=-1
         )  # (B, T_o, 1024)
+        # fused_features = object_obs_enc  # TRYING TRAINING WITH ONLY IMAGE ENCODER
         fused_features = fused_features.reshape(B, -1)  # (B, 1024)
-        observation_vec = fused_features
 
         # OLD: fuse the entire observation sequence with cross-attention
         # observation_vec = self.observation_aggregator(fused_features)  # (B, 512)
-        observation_vec = self.obs_resize(observation_vec)  # (B, 256)
+        observation_vec = self.obs_resize(fused_features)  # (B, 256)
 
         # get sinusoidal position embeddings for time step
         time_enc = self.time_embedding(tau)  # (B, 256)
@@ -404,7 +517,9 @@ class FlowMatching(nn.Module):
         x = x.permute(0, 2, 1)  # (B, T_p, encoding_dim)
         predicted_vector = self.final_proj(x)  # (B, T_p, action_dim)
 
-        return predicted_vector
+        debug = {"img_kp": img_kp}  # for visualization if needed
+
+        return predicted_vector, debug
 
     def forward(self, action, obs, tau=None):
         """Run a forward pass to predict the vector field and compute loss
@@ -427,9 +542,9 @@ class FlowMatching(nn.Module):
         # print(action.shape, noise.shape, target.shape, tau.shape)
         noisy_action = self.noise_action(action, noise=noise, tau=tau)
 
-        pred = self.predict_vector(noisy_action, obs, tau)
+        pred, debug = self.predict_vector(noisy_action, obs, tau)
 
         # loss is MSE between predicted vector field and target
         loss = F.mse_loss(pred, target)
 
-        return pred, loss
+        return pred, loss, debug
