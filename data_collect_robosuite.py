@@ -113,6 +113,7 @@ def collect_human_trajectory(env, device, arm, max_fr):
 
         # Also break if we complete the task
         if task_completion_hold_count == 0:
+            env.successful = True
             break
 
         # state machine to check for having a success for 10 consecutive timesteps
@@ -234,7 +235,10 @@ if __name__ == "__main__":
         type=str,
         default=os.path.join(suite.models.assets_root, "demonstrations_private"),
     )
-    parser.add_argument("--environment", type=str, default="Lift")
+    # Lift, Stack, NutAssembly, NutAssemblySingle, NutAssemblySquare, NutAssemblyRound, PickPlace,
+    # PickPlaceSingle, PickPlaceMilk, PickPlaceBread, PickPlaceCereal, PickPlaceCan, Door, Wipe,
+    # ToolHang, TwoArmLift, TwoArmPegInHole, TwoArmHandover, TwoArmTransport
+    parser.add_argument("--environment", type=str, default="NutAssemblySquare")
     parser.add_argument(
         "--robots",
         nargs="+",
@@ -341,7 +345,7 @@ if __name__ == "__main__":
         use_camera_obs=False,
         reward_shaping=True,
         control_freq=20,
-        placement_initializer=cube_initializer,
+        # placement_initializer=cube_initializer,
     )
 
     # Wrap this with visualization wrapper
@@ -377,7 +381,10 @@ if __name__ == "__main__":
     os.makedirs(new_dir)
 
     # collect demonstrations
+    demonum = 0
     while True:
         collect_human_trajectory(env, device, args.arm, args.max_fr)
         gather_demonstrations_as_hdf5(tmp_directory, new_dir, env_info)
+        demonum += 1
+        print("Completed {} demonstrations".format(demonum))
         device._grasp_state = False  # reset grasp state after each demo

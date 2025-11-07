@@ -1,0 +1,16 @@
+hydra:
+  job:
+    chdir: true
+
+dataset:
+  path: /home/coled/flow-learning/demonstrations/peg/squarepeg.hdf5
+
+training:
+  lr: 0.0001
+  batch_size: 216
+  num_epochs: 300
+  save_freq: 50
+
+flow:
+  action_window_size: 8
+  obs_window_size: 2

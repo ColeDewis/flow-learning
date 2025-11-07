@@ -70,7 +70,8 @@ def main(cfg: DictConfig) -> None:
     )
 
     env: ManipulationEnv = suite.make(
-        "Lift",
+        # "Lift",
+        "NutAssemblySquare",
         renderer="mujoco",
         use_camera_obs=True,
         camera_names=["agentview"],
@@ -81,7 +82,7 @@ def main(cfg: DictConfig) -> None:
         render_camera="agentview",
         **options,
         # control_freq=10,
-        placement_initializer=cube_initializer,
+        # placement_initializer=cube_initializer,
     )
 
     env.reset()
@@ -108,9 +109,10 @@ def main(cfg: DictConfig) -> None:
     # DIR = (
     #     "/home/coled/flow-learning/outputs/2025-11-05/14-36-50"  # visualization testing
     # )
-    DIR = "/home/coled/flow-learning/outputs/2025-11-06/16-40-34"
+    # DIR = "/home/coled/flow-learning/outputs/2025-11-06/16-40-34"
+    DIR = "/home/coled/flow-learning/outputs/2025-11-07/11-41-52"  # SquareNut dino
 
-    model.load_state_dict(torch.load(f"{DIR}/flow_epoch_25.pth"))
+    model.load_state_dict(torch.load(f"{DIR}/flow_epoch_100.pth"))
     with open(f"{DIR}/normalization_stats.pkl", "rb") as f:
         normalization_stats = pickle.load(f)
     with open(f"{DIR}/action_normalization_stats.pkl", "rb") as f:
@@ -143,7 +145,7 @@ def main(cfg: DictConfig) -> None:
                 ]
             ),
             "gripper": np.array([obs["robot0_gripper_qpos"]]),
-            "object": np.array([obs["object-state"]]),
+            # "object": np.array([obs["object-state"]]),
         }
         obs_history.append(current_obs)
 
@@ -160,7 +162,7 @@ def main(cfg: DictConfig) -> None:
             images = images * 255.0  # to [0, 255] range
             joints = np.stack([h["joints"] for h in obs_history])
             grippers = np.stack([h["gripper"] for h in obs_history])
-            objects = np.stack([h["object"] for h in obs_history])
+            # objects = np.stack([h["object"] for h in obs_history])
 
             obs_tensor = {
                 "obs": {
@@ -173,7 +175,7 @@ def main(cfg: DictConfig) -> None:
                     "robot0_gripper_qpos": torch.tensor(
                         grippers, dtype=torch.float32
                     ).unsqueeze(0),
-                    "object": torch.tensor(objects, dtype=torch.float32).unsqueeze(0),
+                    # "object": torch.tensor(objects, dtype=torch.float32).unsqueeze(0),
                 }
             }
 
@@ -227,7 +229,7 @@ def main(cfg: DictConfig) -> None:
                 print("Inferred Action:", [round(x, 2) for x in action_i.tolist()])
 
                 action_i = np.clip(action_i, env.action_spec[0], env.action_spec[1])
-                action_i[3:6] = 0.0  # zero out rotation for simplicity
+                # action_i[3:6] = 0.0  # zero out rotation for simplicity
                 obs, reward, done, info = env.step(action_i)
                 success = env._check_success()
 

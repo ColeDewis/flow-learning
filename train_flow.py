@@ -74,9 +74,9 @@ def prepare_batch(
     batch["obs"]["gripper"] = (
         batch["obs"]["gripper"][:, :obs_window_size].float().to(device)
     )
-    batch["obs"]["object"] = (
-        batch["obs"]["object"][:, :obs_window_size].float().to(device)
-    )
+    # batch["obs"]["object"] = (
+    #     batch["obs"]["object"][:, :obs_window_size].float().to(device)
+    # )
 
     if has_actions:
         batch["actions"] = (
@@ -88,6 +88,7 @@ def prepare_batch(
 
 @hydra.main(config_path="conf", config_name="default", version_base=None)
 def train(cfg: DictConfig) -> None:
+    print("Dataset path:", cfg.dataset.path)
     lr = cfg.training.lr
     batch_size = cfg.training.batch_size
     num_epochs = cfg.training.num_epochs
@@ -152,7 +153,7 @@ def train(cfg: DictConfig) -> None:
             "agentview_image",
             "robot0_eye_in_hand_image",
             "robot0_joint_pos",
-            "object",
+            # "object",
         ),
         action_keys=("actions",),
         action_config={"actions": {"normalization": "min_max"}},
@@ -177,7 +178,7 @@ def train(cfg: DictConfig) -> None:
             "agentview_image",
             "robot0_eye_in_hand_image",
             "robot0_joint_pos",
-            "object",
+            # "object",
         ),
         action_keys=("actions",),
         action_config={"actions": {"normalization": "min_max"}},
@@ -304,7 +305,7 @@ def train(cfg: DictConfig) -> None:
             batch["obs"]["images"] = batch["obs"]["images"][r_sample].unsqueeze(0)
             batch["obs"]["joints"] = batch["obs"]["joints"][r_sample].unsqueeze(0)
             batch["obs"]["gripper"] = batch["obs"]["gripper"][r_sample].unsqueeze(0)
-            batch["obs"]["object"] = batch["obs"]["object"][r_sample].unsqueeze(0)
+            # batch["obs"]["object"] = batch["obs"]["object"][r_sample].unsqueeze(0)
             example_pred, debug = model.infer(batch["obs"], delta=0.1)
             print("Example Inference Action:", example_pred[0, 0])
             example_kp = debug["img_kp"][0].cpu().numpy()

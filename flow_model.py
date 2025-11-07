@@ -34,12 +34,13 @@ class DinoEncoder(nn.Module):
         )
 
     def forward(self, image):
-        resized_images = F.interpolate(
-            image,
-            size=(self.input_size, self.input_size),
-            mode="bilinear",
-            align_corners=False,
-        )
+        # resized_images = F.interpolate(
+        #     image,
+        #     size=(self.input_size, self.input_size),
+        #     mode="bilinear",
+        #     align_corners=False,
+        # )
+        resized_images = image
         dino_image = self.dinov2.get_intermediate_layers(
             resized_images, n=1, reshape=True, return_class_token=False
         )[0]
@@ -49,7 +50,6 @@ class DinoEncoder(nn.Module):
         return projected_im
 
 
-# Trying the LeRobot version now but it seems same.
 class SpatialSoftmax(nn.Module):
     def __init__(self, height: int, width: int, in_channel: int, n_keypoints: int):
         """
@@ -275,7 +275,7 @@ class FlowMatching(nn.Module):
 
         # --- OBSERVATION ENCODINGS
         # resnet-18 image encoder, as in diffusion policy.
-        resnet = resnet18(norm_layer=lambda c: nn.GroupNorm(8, c), pretrained=False)
+        # resnet = resnet18(norm_layer=lambda c: nn.GroupNorm(8, c), pretrained=False)
         # NOTE: below print confirmed they're actually groupnorms.
         # for name, module in resnet.named_modules():
         #     print(f"{name}: {type(module)}")
@@ -296,8 +296,8 @@ class FlowMatching(nn.Module):
         #     *list(resnet.children())[:-2],
         #     SpatialSoftmax(height=3, width=3, in_channel=512, n_keypoints=n_kp),
         # )
-        # self.image_encoder = nn.Sequential(dino, SpatialSoftmax(6, 6, n_kp, n_kp))
-        self.image_encoder = nn.Sequential(*list(resnet.children())[:-1], nn.Flatten())
+        self.image_encoder = nn.Sequential(dino, SpatialSoftmax(3, 3, n_kp, n_kp))
+        # self.image_encoder = nn.Sequential(*list(resnet.children())[:-1], nn.Flatten())
         self.keypoint_scaler = nn.Linear(n_kp * 2, 512)
         self.joint_encoder = nn.Sequential(
             nn.Linear(self.robot_state_dim, 256),
@@ -449,7 +449,7 @@ class FlowMatching(nn.Module):
         images = obs["images"]
         joints = obs["joints"]
         gripper = obs["gripper"]
-        object_pos = obs["object"]
+        # object_pos = obs["object"]
 
         if gripper.dim() != joints.dim():
             gripper = gripper.unsqueeze(-1)
@@ -468,8 +468,8 @@ class FlowMatching(nn.Module):
                 B * T_o, images.shape[2], images.shape[3], images.shape[4]
             )
             img_kp = self.image_encoder(images)  # (B*T_o, n_kp * 2)
-            # img_enc = self.keypoint_scaler(img_kp)  # (B*T_o, 512)
-            img_enc = img_kp  # no softmax test
+            img_enc = self.keypoint_scaler(img_kp)  # (B*T_o, 512)
+            # img_enc = img_kp  # no softmax test
             object_obs_enc = img_enc
         else:
             object_enc = self.object_encoder(object_pos)  # (B*T_o, 512)

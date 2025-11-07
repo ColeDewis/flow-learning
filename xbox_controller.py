@@ -97,11 +97,14 @@ class XboxControllerDevice(Device):
         # Get rotation (right stick) with deadzone applied
         raw_drotation = np.array(
             [
-                self._apply_deadzone(self.controller.get_axis(4)),  # Right stick X-axis
-                -self._apply_deadzone(
-                    self.controller.get_axis(3)
-                ),  # Right stick Y-axis (invert for natural movement)
-                0.0,  # No roll control for now
+                0.0,
+                0.0,
+                -self._apply_deadzone(self.controller.get_axis(3)),
+                # self._apply_deadzone(self.controller.get_axis(4)),  # Right stick X-axis
+                # -self._apply_deadzone(
+                #     self.controller.get_axis(3)
+                # ),  # Right stick Y-axis (invert for natural movement)
+                # 0.0,  # No roll control for now
             ]
         )
 
@@ -125,7 +128,7 @@ class XboxControllerDevice(Device):
         return {
             "dpos": dpos * 3,
             "rotation": np.eye(3),  # Identity matrix for absolute rotation
-            "raw_drotation": raw_drotation,
+            "raw_drotation": raw_drotation * 2,
             "grasp": self._grasp_state,
             "reset": reset,
             "base_mode": base_mode,
