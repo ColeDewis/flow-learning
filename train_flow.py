@@ -9,13 +9,14 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 import torchvision.transforms as T
-import wandb
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 import robomimic.utils.obs_utils as ObsUtils
+import wandb
 from flow_model import FlowMatching
+from model_utils import EMA
 from robomimic.config import config_factory
 from robomimic.utils.dataset import SequenceDataset
 
@@ -26,7 +27,6 @@ def prepare_batch(
     obs_window_size: int,
     device: torch.device,
     has_actions=True,
-    inference=False,
 ) -> dict:
     """Processes the batch from robomimic into a nicer form by normalizing images
     and organizing to have nicer keys for the model.
@@ -105,9 +105,11 @@ def train(cfg: DictConfig) -> None:
         obs_window_size=obs_window_size,
         action_dim=action_dim,
         action_window_size=action_window_size,
-        image_input=True,
-        # image_input=False,
+        encoder="dino",
     )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model_ema = EMA(model, decay=0.95)
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
     warmup_epochs = 10
@@ -120,9 +122,6 @@ def train(cfg: DictConfig) -> None:
         schedulers=[warmup_scheduler, cosine_scheduler],
         milestones=[warmup_epochs],
     )
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
 
     obs_modalities = {
         "obs": {
@@ -144,6 +143,7 @@ def train(cfg: DictConfig) -> None:
     }
     ObsUtils.initialize_obs_utils_with_obs_specs(obs_modalities)
 
+    # TODO: for pointclouds, need to figure out how to do this for the dataloader
     train_dataset = SequenceDataset(
         hdf5_path=cfg.dataset.path,
         obs_keys=(
@@ -286,10 +286,12 @@ def train(cfg: DictConfig) -> None:
                 # print("PREDICTIONS:", preds.shape)
                 loss.backward()
                 optimizer.step()
+                model_ema.update()
                 epoch_loss += loss.item()
                 tepoch.set_postfix(loss=loss.item())
 
         # run validation after each epoch
+        model_ema.apply_ema()
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
@@ -314,13 +316,14 @@ def train(cfg: DictConfig) -> None:
         val_loss /= len(valid_loader)
         print(f"Epoch {epoch+1}/{num_epochs} - Validation Loss: {val_loss:.4f}")
 
+        model_ema.restore()
         if val_loss < best_loss:
             best_loss = val_loss
-            torch.save(model.state_dict(), "best_flow.pth")
+            torch.save(model_ema.ema_params, "best_flow.pth")
             print(f"New best model saved with loss {best_loss:.4f}")
 
         if (epoch + 1) % save_freq == 0:
-            torch.save(model.state_dict(), f"flow_epoch_{epoch+1}.pth")
+            torch.save(model_ema.ema_params, f"flow_epoch_{epoch+1}.pth")
 
             # visualize keypoints on an example image from the validation set
             # example_im = batch["obs"]["images"][0, 0]  # first image in the window
@@ -349,7 +352,7 @@ def train(cfg: DictConfig) -> None:
             }
         )
 
-    torch.save(model.state_dict(), "final_flow.pth")
+    torch.save(model_ema.ema_params, "final_flow.pth")
     wandb.finish()
 
 

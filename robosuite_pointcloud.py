@@ -2,8 +2,10 @@
 
 import os
 
+import matplotlib.pyplot as plt
 import numpy as np
 import robosuite
+from fpsample import bucket_fps_kdtree_sampling
 from robosuite.utils import camera_utils, transform_utils
 
 
@@ -76,13 +78,22 @@ class PointCloud:
         return pc
 
 
+def visualize_pointcloud(points, colors):
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection="3d")
+    ax.scatter(points[:, 0], points[:, 1], points[:, 2], c=colors)
+    plt.show()
+
+
 pointcloud = PointCloud()
 
 env = robosuite.make(
     "NutAssemblySquare",
+    robots="Panda",
     renderer="mujoco",
     use_camera_obs=True,
     camera_names=["agentview", "robot0_eye_in_hand"],
+    camera_depths=True,
     camera_heights=240,
     camera_widths=320,
     has_renderer=True,
@@ -103,6 +114,21 @@ hand_points, hand_colors = pointcloud.gen_points(obs, env, "robot0_eye_in_hand")
 # transfer to world coordinate system
 agent_points = pointcloud.pc_cam_to_pc_world(agent_points, agent_ex)
 hand_points = pointcloud.pc_cam_to_pc_world(hand_points, hand_ex)
+
+# downsample
+downsampled_agent_idx = bucket_fps_kdtree_sampling(agent_points, n_samples=1000)
+downsampled_hand_idx = bucket_fps_kdtree_sampling(hand_points, n_samples=1000)
+
+downsampled_agent = agent_points[downsampled_agent_idx]
+downsampled_hand = hand_points[downsampled_hand_idx]
+agent_colors = agent_colors[downsampled_agent_idx]
+hand_colors = hand_colors[downsampled_hand_idx]
+
+visualize_pointcloud(downsampled_agent, agent_colors)
+visualize_pointcloud(downsampled_hand, hand_colors)
+
+print(downsampled_agent.shape, downsampled_hand.shape)
+
 
 # Can combine with open3d it seems
 # points = np.concatenate([agent_points, hand_points], axis=0)

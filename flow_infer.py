@@ -11,7 +11,6 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 import torchvision.transforms as T
-import wandb
 from omegaconf import DictConfig, OmegaConf
 from robosuite.controllers.composite.composite_controller_factory import (
     refactor_composite_controller_config,
@@ -23,6 +22,7 @@ from torchvision.transforms import Compose, Resize, ToTensor
 from tqdm import tqdm
 
 import robomimic.utils.obs_utils as ObsUtils
+import wandb
 from flow_model import FlowMatching
 from robomimic.utils.dataset import SequenceDataset
 from train_flow import prepare_batch
@@ -90,7 +90,7 @@ def main(cfg: DictConfig) -> None:
     obs = env.reset()
 
     model = FlowMatching(
-        action_dim=action_dim, action_window_size=action_window_size, image_input=True
+        action_dim=action_dim, action_window_size=action_window_size, encoder="dino"
     )
     # DIR = "/home/coled/flow-learning/outputs/2025-10-22/08-52-39"
     # DIR = "/home/coled/flow-learning/outputs/2025-10-21/16-55-38"

@@ -7,47 +7,7 @@ import torch.nn.functional as F
 from torchvision.models import resnet18
 from torchvision.transforms import Resize
 
-
-class DinoEncoder(nn.Module):
-    def __init__(
-        self, output_dim, device="cuda" if torch.cuda.is_available() else "cpu"
-    ):
-        super(DinoEncoder, self).__init__()
-        self.dinov2 = (
-            torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")  # vitb14
-            .eval()
-            .to(device)
-        )
-        self.patch_size = 14  # DINOv2 patch size
-        self.dino_embed_dim = 384  # DINOv2 embed dim
-        self.input_size = 224
-
-        for param in self.dinov2.parameters():
-            param.requires_grad = False
-
-        self.projection = nn.Conv2d(
-            in_channels=self.dino_embed_dim,
-            out_channels=output_dim,
-            kernel_size=3,
-            stride=2,
-            padding=1,
-        )
-
-    def forward(self, image):
-        # resized_images = F.interpolate(
-        #     image,
-        #     size=(self.input_size, self.input_size),
-        #     mode="bilinear",
-        #     align_corners=False,
-        # )
-        resized_images = image
-        dino_image = self.dinov2.get_intermediate_layers(
-            resized_images, n=1, reshape=True, return_class_token=False
-        )[0]
-
-        projected_im = self.projection(dino_image)
-
-        return projected_im
+from encoders import DinoEncoder, PointCloudEncoder, ResnetEncoder
 
 
 class SpatialSoftmax(nn.Module):
@@ -246,10 +206,10 @@ class FlowMatching(nn.Module):
         robot_state_dim: int = 8,
         action_window_size: int = 8,
         encoding_dim: int = 256,
-        # block_channels: list = [256, 512, 1024, 2048],
         block_channels: list = [256, 512, 1024],
         block_depth: int = 3,
-        image_input: bool = True,
+        num_softmax_kp: int = 16,
+        encoder: str = "resnet",
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
     ):
         """Flow matching model
@@ -261,6 +221,7 @@ class FlowMatching(nn.Module):
             encoding_dim (int, optional): dimension to encode images and robot state to. Defaults to 256.
             block_channels (list, optional): UNet block sizes; last is bottleneck size. Defaults to [256, 512, 1024].
             block_depth (int, optional): number of conv1d blocks in a unet layer. Defaults to 3.
+            num_softmax_kp (int, optional): number of spatial softmax keypoints. Defaults to 16.
             device (str, optional): torch device. Defaults to "cuda" if torch.cuda.is_available() else "cpu".
         """
         # TODO: probably this is a UNet, transformer unet? Look at examples.
@@ -271,50 +232,34 @@ class FlowMatching(nn.Module):
         self.action_window_size = action_window_size
         self.encoding_dim = encoding_dim
         self.obs_window_size = obs_window_size
-        self.image_input = image_input
+        self.encoder = encoder
 
         # --- OBSERVATION ENCODINGS
-        # resnet-18 image encoder, as in diffusion policy.
-        # resnet = resnet18(norm_layer=lambda c: nn.GroupNorm(8, c), pretrained=False)
-        # NOTE: below print confirmed they're actually groupnorms.
-        # for name, module in resnet.named_modules():
-        #     print(f"{name}: {type(module)}")
-        # ABOVE GIVES 3x3, which is fine from Dylan. we can make it larger if needed below
-        # resnet.maxpool = nn.Identity()
-        # for layer_name in ["layer3", "layer4"]:
-        #     layer = getattr(resnet, layer_name)
-        #     for block in layer:
-        #         if isinstance(block.downsample, nn.Sequential):
-        #             # Modify the stride in the downsample convolution
-        #             block.downsample[0].stride = (1, 1)
-        #         block.conv1.stride = (1, 1)
 
         n_kp = 16
-        dino = DinoEncoder(output_dim=n_kp, device=self.device)
+        if encoder == "resnet":
+            self.encoder = ResnetEncoder(flatten=False)
+        elif encoder == "pointcloud":
+            self.encoder = PointCloudEncoder(in_ch=3, out_ch=256)
+        elif encoder == "dino":
+            self.encoder = DinoEncoder(output_dim=n_kp, device=self.device)
+        elif encoder == "object":
+            self.encoder = nn.Sequential(
+                nn.Linear(10, 512),
+                nn.GELU(),
+                nn.Linear(512, 512),
+            )
+        else:
+            raise ValueError("encoder should be 'resnet', 'pointcloud', 'dino'.")
 
-        # self.image_encoder = nn.Sequential(
-        #     *list(resnet.children())[:-2],
-        #     SpatialSoftmax(height=3, width=3, in_channel=512, n_keypoints=n_kp),
-        # )
-        self.image_encoder = nn.Sequential(dino, SpatialSoftmax(3, 3, n_kp, n_kp))
-        # self.image_encoder = nn.Sequential(*list(resnet.children())[:-1], nn.Flatten())
-        self.keypoint_scaler = nn.Linear(n_kp * 2, 512)
+        self.spatial_softmax = SpatialSoftmax(3, 3, num_softmax_kp, num_softmax_kp)
+        self.keypoint_scaler = nn.Linear(num_softmax_kp * 2, 512)
         self.joint_encoder = nn.Sequential(
             nn.Linear(self.robot_state_dim, 256),
             nn.GELU(),
             nn.Linear(256, 512),
         )
-        self.object_encoder = nn.Sequential(
-            nn.Linear(10, 512),
-            nn.GELU(),
-            nn.Linear(512, 512),
-        )
-        # self.observation_aggregator = CrossAttentionAggregator(
-        #     feature_dim=512, num_heads=4
-        # )
-        # IMAGES ONLY:
-        # self.obs_resize = nn.Linear(512 * self.obs_window_size, self.encoding_dim // 2)
-        # IMAGES AND ROBOT STATE:
+
         self.obs_resize = nn.Linear(1024 * self.obs_window_size, self.encoding_dim // 2)
         # --- End
 
@@ -446,46 +391,44 @@ class FlowMatching(nn.Module):
         Returns:
             tensor: predicted vector field
         """
-        images = obs["images"]
         joints = obs["joints"]
         gripper = obs["gripper"]
-        # object_pos = obs["object"]
 
         if gripper.dim() != joints.dim():
             gripper = gripper.unsqueeze(-1)
         joints = torch.cat([joints, gripper], dim=-1)
-
-        # images = images.permute(0, 1, 4, 2, 3)  # (B, T_o, C, H, W)
 
         # reshape observations for encoders
         B, T_o = joints.shape[:2]
         joints = joints.reshape(B * T_o, -1)  # (B*T_o, joint_dim)
         joint_enc = self.joint_encoder(joints)  # (B*T_o, 512)
 
-        if self.image_input:
+        if self.encoder in ("dino", "resnet"):
+            images = obs["images"]
             # (B*T_o, C, H, W)
             images = images.reshape(
                 B * T_o, images.shape[2], images.shape[3], images.shape[4]
             )
-            img_kp = self.image_encoder(images)  # (B*T_o, n_kp * 2)
+            encoded = self.encoder(images)  # (B*T_o, n_kp * 2)
+            img_kp = self.spatial_softmax(encoded)  # (B*T_o, n_kp*2)
             img_enc = self.keypoint_scaler(img_kp)  # (B*T_o, 512)
-            # img_enc = img_kp  # no softmax test
-            object_obs_enc = img_enc
+            encoded_obs = img_enc
+        elif self.encoder == "pointcloud":
+            pointclouds = obs["pointclouds"]
+            # (B*T_o, N, 3)
+            pointclouds = pointclouds.reshape(B * T_o, pointclouds.shape[2], 3)
+            pc_enc = self.encoder(pointclouds)
+            encoded_obs = pc_enc
         else:
-            object_enc = self.object_encoder(object_pos)  # (B*T_o, 512)
-            object_obs_enc = object_enc
+            object_pos = obs["object"]
+            object_enc = self.encoder(object_pos)  # (B*T_o, 512)
+            encoded_obs = object_enc
 
         # concatenate entire observation sequence
-        object_obs_enc = object_obs_enc.view(B, T_o, -1)
+        encoded_obs = encoded_obs.view(B, T_o, -1)
         joint_enc = joint_enc.view(B, T_o, -1)
-        fused_features = torch.cat(
-            [object_obs_enc, joint_enc], dim=-1
-        )  # (B, T_o, 1024)
-        # fused_features = object_obs_enc  # TRYING TRAINING WITH ONLY IMAGE ENCODER
+        fused_features = torch.cat([encoded_obs, joint_enc], dim=-1)  # (B, T_o, 1024)
         fused_features = fused_features.reshape(B, -1)  # (B, 1024)
-
-        # OLD: fuse the entire observation sequence with cross-attention
-        # observation_vec = self.observation_aggregator(fused_features)  # (B, 512)
         observation_vec = self.obs_resize(fused_features)  # (B, 256)
 
         # get sinusoidal position embeddings for time step
@@ -517,7 +460,10 @@ class FlowMatching(nn.Module):
         x = x.permute(0, 2, 1)  # (B, T_p, encoding_dim)
         predicted_vector = self.final_proj(x)  # (B, T_p, action_dim)
 
-        debug = {"img_kp": img_kp}  # for visualization if needed
+        if self.encoder in ("dino", "resnet"):
+            debug = {"img_kp": img_kp}  # for visualization if needed
+        else:
+            debug = {}
 
         return predicted_vector, debug
 
