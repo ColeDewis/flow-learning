@@ -209,6 +209,7 @@ class FlowMatching(nn.Module):
         block_channels: list = [256, 512, 1024],
         block_depth: int = 3,
         num_softmax_kp: int = 16,
+        num_obs: int = 1,
         encoder: str = "resnet",
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
     ):
@@ -222,6 +223,7 @@ class FlowMatching(nn.Module):
             block_channels (list, optional): UNet block sizes; last is bottleneck size. Defaults to [256, 512, 1024].
             block_depth (int, optional): number of conv1d blocks in a unet layer. Defaults to 3.
             num_softmax_kp (int, optional): number of spatial softmax keypoints. Defaults to 16.
+            num_obs (int, optional): number of observations, e.g. is there 1 or 2 images, 1 or 2 object states. Defaults to 1.
             device (str, optional): torch device. Defaults to "cuda" if torch.cuda.is_available() else "cpu".
         """
         # TODO: probably this is a UNet, transformer unet? Look at examples.
@@ -232,35 +234,50 @@ class FlowMatching(nn.Module):
         self.action_window_size = action_window_size
         self.encoding_dim = encoding_dim
         self.obs_window_size = obs_window_size
-        self.encoder = encoder
+        self.encoder_type = encoder
+        self.num_obs = num_obs
 
         # --- OBSERVATION ENCODINGS
 
-        n_kp = 16
-        if encoder == "resnet":
-            self.encoder = ResnetEncoder(flatten=False)
-        elif encoder == "pointcloud":
-            self.encoder = PointCloudEncoder(in_ch=3, out_ch=256)
-        elif encoder == "dino":
-            self.encoder = DinoEncoder(output_dim=n_kp, device=self.device)
-        elif encoder == "object":
-            self.encoder = nn.Sequential(
-                nn.Linear(10, 512),
-                nn.GELU(),
-                nn.Linear(512, 512),
-            )
-        else:
-            raise ValueError("encoder should be 'resnet', 'pointcloud', 'dino'.")
+        n_kp = num_softmax_kp
+        self.encoders = nn.ModuleList()
+        for _ in range(num_obs):
+            if encoder == "resnet":
+                enc = nn.Sequential(
+                    ResnetEncoder(flatten=False),
+                    SpatialSoftmax(3, 3, 512, n_kp),
+                    nn.Linear(n_kp * 2, 512),
+                )
+                self.encoders.append(enc)
+            elif encoder == "pointcloud":
+                self.encoders.append(PointCloudEncoder(in_ch=3, out_ch=256))
+            elif encoder == "dino":
+                enc = nn.Sequential(
+                    DinoEncoder(output_dim=n_kp, device=self.device),
+                    SpatialSoftmax(3, 3, n_kp, n_kp),
+                    nn.Linear(n_kp * 2, 512),
+                )
+                self.encoders.append(enc)
+            elif encoder == "object":
+                self.encoders.append(
+                    nn.Sequential(
+                        nn.Linear(10, 512),
+                        nn.GELU(),
+                        nn.Linear(512, 512),
+                    )
+                )
+            else:
+                raise ValueError("encoder should be 'resnet', 'pointcloud', 'dino'.")
 
-        self.spatial_softmax = SpatialSoftmax(3, 3, num_softmax_kp, num_softmax_kp)
-        self.keypoint_scaler = nn.Linear(num_softmax_kp * 2, 512)
         self.joint_encoder = nn.Sequential(
             nn.Linear(self.robot_state_dim, 256),
             nn.GELU(),
             nn.Linear(256, 512),
         )
 
-        self.obs_resize = nn.Linear(1024 * self.obs_window_size, self.encoding_dim // 2)
+        self.obs_resize = nn.Linear(
+            (512 + 512 * self.num_obs) * self.obs_window_size, self.encoding_dim // 2
+        )
         # --- End
 
         self.time_embedding = SinusoidalPositionEmbeddings(dim=self.encoding_dim // 2)
@@ -403,28 +420,32 @@ class FlowMatching(nn.Module):
         joints = joints.reshape(B * T_o, -1)  # (B*T_o, joint_dim)
         joint_enc = self.joint_encoder(joints)  # (B*T_o, 512)
 
-        if self.encoder in ("dino", "resnet"):
-            images = obs["images"]
-            # (B*T_o, C, H, W)
-            images = images.reshape(
-                B * T_o, images.shape[2], images.shape[3], images.shape[4]
-            )
-            encoded = self.encoder(images)  # (B*T_o, n_kp * 2)
-            img_kp = self.spatial_softmax(encoded)  # (B*T_o, n_kp*2)
-            img_enc = self.keypoint_scaler(img_kp)  # (B*T_o, 512)
-            encoded_obs = img_enc
-        elif self.encoder == "pointcloud":
-            pointclouds = obs["pointclouds"]
-            # (B*T_o, N, 3)
-            pointclouds = pointclouds.reshape(B * T_o, pointclouds.shape[2], 3)
-            pc_enc = self.encoder(pointclouds)
-            encoded_obs = pc_enc
+        all_encodings = []
+        if self.encoder_type in ("dino", "resnet"):
+            for i in range(self.num_obs):
+                images = obs[f"images_{i+1}"]
+                # (B*T_o, C, H, W)
+                images = images.reshape(
+                    B * T_o, images.shape[2], images.shape[3], images.shape[4]
+                )
+                img_enc = self.encoders[i](images)  # (B*T_o, 512)
+                all_encodings.append(img_enc)
+        elif self.encoder_type == "pointcloud":
+            for i in range(self.num_obs):
+                pointclouds = obs[f"pointclouds_{i+1}"]
+                # (B*T_o, N, 3)
+                pointclouds = pointclouds.reshape(B * T_o, pointclouds.shape[2], 3)
+                pc_enc = self.encoders[i](pointclouds)
+                all_encodings.append(pc_enc)
+
         else:
-            object_pos = obs["object"]
-            object_enc = self.encoder(object_pos)  # (B*T_o, 512)
-            encoded_obs = object_enc
+            for i in range(self.num_obs):
+                object_pos = obs[f"object_{i+1}"]
+                object_enc = self.encoders[i](object_pos)  # (B*T_o, 512)
+                all_encodings.append(object_enc)
 
         # concatenate entire observation sequence
+        encoded_obs = torch.cat(all_encodings, dim=1)
         encoded_obs = encoded_obs.view(B, T_o, -1)
         joint_enc = joint_enc.view(B, T_o, -1)
         fused_features = torch.cat([encoded_obs, joint_enc], dim=-1)  # (B, T_o, 1024)
@@ -460,10 +481,8 @@ class FlowMatching(nn.Module):
         x = x.permute(0, 2, 1)  # (B, T_p, encoding_dim)
         predicted_vector = self.final_proj(x)  # (B, T_p, action_dim)
 
-        if self.encoder in ("dino", "resnet"):
-            debug = {"img_kp": img_kp}  # for visualization if needed
-        else:
-            debug = {}
+        # TODO maybe get debug keypoints back although they're not useful.
+        debug = {}
 
         return predicted_vector, debug
 

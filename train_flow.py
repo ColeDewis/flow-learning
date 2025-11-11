@@ -9,12 +9,12 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 import torchvision.transforms as T
+import wandb
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 import robomimic.utils.obs_utils as ObsUtils
-import wandb
 from flow_model import FlowMatching
 from model_utils import EMA
 from robomimic.config import config_factory
@@ -53,20 +53,24 @@ def prepare_batch(
 
     ObsUtils.normalize_dict(batch["obs"], normalization_stats=normalization_stats)
 
-    batch["obs"]["images"] = batch["obs"].pop("agentview_image")
+    batch["obs"]["images_1"] = batch["obs"].pop("agentview_image")
+    batch["obs"]["images_2"] = batch["obs"].pop("robot0_eye_in_hand_image")
 
     # scale to [-1, 1]
-    batch["obs"]["images"] = (batch["obs"]["images"] / 255.0) * 2.0 - 1.0
+    batch["obs"]["images_1"] = (batch["obs"]["images_1"] / 255.0) * 2.0 - 1.0
+    batch["obs"]["images_2"] = (batch["obs"]["images_2"] / 255.0) * 2.0 - 1.0
 
     batch["obs"]["joints"] = batch["obs"].pop("robot0_joint_pos")
     batch["obs"]["gripper"] = batch["obs"].pop("robot0_gripper_qpos")[:, :, 0]
 
-    # TODO: try normalization to [-1, 1] by dividing by 255 then -1 * 2.
     # TODO: could consider adding a small random crop to the images
 
     # grab correct windows
-    batch["obs"]["images"] = (
-        batch["obs"]["images"][:, :obs_window_size].float().to(device)
+    batch["obs"]["images_1"] = (
+        batch["obs"]["images_1"][:, :obs_window_size].float().to(device)
+    )
+    batch["obs"]["images_2"] = (
+        batch["obs"]["images_2"][:, :obs_window_size].float().to(device)
     )
     batch["obs"]["joints"] = (
         batch["obs"]["joints"][:, :obs_window_size].float().to(device)
@@ -105,7 +109,8 @@ def train(cfg: DictConfig) -> None:
         obs_window_size=obs_window_size,
         action_dim=action_dim,
         action_window_size=action_window_size,
-        encoder="dino",
+        encoder="resnet",
+        num_obs=2,
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -223,7 +228,7 @@ def train(cfg: DictConfig) -> None:
     # print(train_dataset.n_demos, valid_dataset.n_demos)
     # data1 = train_dataset[0]
     # data2 = valid_dataset[0]
-    # imgs1 = data1["obs"]["agentview_image"]
+    # imgs1 = data1["obs"]["robot0_eye_in_hand_image"]
     # imgs2 = data2["obs"]["agentview_image"]
     # import cv2
 
@@ -303,27 +308,25 @@ def train(cfg: DictConfig) -> None:
                 val_loss += loss.item()
 
             # sample inference
-            r_sample = np.random.randint(0, batch["obs"]["images"].shape[0])
-            batch["obs"]["images"] = batch["obs"]["images"][r_sample].unsqueeze(0)
+            r_sample = np.random.randint(0, batch["obs"]["images_1"].shape[0])
+            batch["obs"]["images_1"] = batch["obs"]["images_1"][r_sample].unsqueeze(0)
+            batch["obs"]["images_2"] = batch["obs"]["images_2"][r_sample].unsqueeze(0)
             batch["obs"]["joints"] = batch["obs"]["joints"][r_sample].unsqueeze(0)
             batch["obs"]["gripper"] = batch["obs"]["gripper"][r_sample].unsqueeze(0)
             # batch["obs"]["object"] = batch["obs"]["object"][r_sample].unsqueeze(0)
             example_pred, debug = model.infer(batch["obs"], delta=0.1)
             print("Example Inference Action:", example_pred[0, 0])
-            example_kp = debug["img_kp"][0].cpu().numpy()
-            # print("Example Keypoints:", [round(x, 2) for x in example_kp.tolist()])
 
         val_loss /= len(valid_loader)
         print(f"Epoch {epoch+1}/{num_epochs} - Validation Loss: {val_loss:.4f}")
 
-        model_ema.restore()
         if val_loss < best_loss:
             best_loss = val_loss
-            torch.save(model_ema.ema_params, "best_flow.pth")
+            torch.save(model.state_dict(), "best_flow.pth")
             print(f"New best model saved with loss {best_loss:.4f}")
 
         if (epoch + 1) % save_freq == 0:
-            torch.save(model_ema.ema_params, f"flow_epoch_{epoch+1}.pth")
+            torch.save(model.state_dict(), f"flow_epoch_{epoch+1}.pth")
 
             # visualize keypoints on an example image from the validation set
             # example_im = batch["obs"]["images"][0, 0]  # first image in the window
@@ -342,6 +345,8 @@ def train(cfg: DictConfig) -> None:
             #     example_im = cv2.circle(example_im, (kp_x, kp_y), 2, (0, 255, 0), -1)
             # cv2.imwrite(f"keypoints_epoch_{epoch+1}.png", example_im)
 
+        model_ema.restore()
+
         scheduler.step()
         run.log(
             {
@@ -352,7 +357,9 @@ def train(cfg: DictConfig) -> None:
             }
         )
 
-    torch.save(model_ema.ema_params, "final_flow.pth")
+    model_ema.apply_ema()
+    torch.save(model.state_dict(), "final_flow.pth")
+    model_ema.restore()
     wandb.finish()
 
 

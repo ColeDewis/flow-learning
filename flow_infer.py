@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 import torchvision.transforms as T
+import wandb
 from omegaconf import DictConfig, OmegaConf
 from robosuite.controllers.composite.composite_controller_factory import (
     refactor_composite_controller_config,
@@ -22,7 +23,6 @@ from torchvision.transforms import Compose, Resize, ToTensor
 from tqdm import tqdm
 
 import robomimic.utils.obs_utils as ObsUtils
-import wandb
 from flow_model import FlowMatching
 from robomimic.utils.dataset import SequenceDataset
 from train_flow import prepare_batch
@@ -69,12 +69,13 @@ def main(cfg: DictConfig) -> None:
         z_offset=0.01,
     )
 
+    # TODO add second cam.
     env: ManipulationEnv = suite.make(
         # "Lift",
         "NutAssemblySquare",
         renderer="mujoco",
         use_camera_obs=True,
-        camera_names=["agentview"],
+        camera_names=["agentview", "robot0_eye_in_hand"],
         camera_heights=84,
         camera_widths=84,
         has_renderer=True,
@@ -90,7 +91,10 @@ def main(cfg: DictConfig) -> None:
     obs = env.reset()
 
     model = FlowMatching(
-        action_dim=action_dim, action_window_size=action_window_size, encoder="dino"
+        action_dim=action_dim,
+        action_window_size=action_window_size,
+        encoder="resnet",
+        num_obs=2,
     )
     # DIR = "/home/coled/flow-learning/outputs/2025-10-22/08-52-39"
     # DIR = "/home/coled/flow-learning/outputs/2025-10-21/16-55-38"
@@ -110,9 +114,10 @@ def main(cfg: DictConfig) -> None:
     #     "/home/coled/flow-learning/outputs/2025-11-05/14-36-50"  # visualization testing
     # )
     # DIR = "/home/coled/flow-learning/outputs/2025-11-06/16-40-34"
-    DIR = "/home/coled/flow-learning/outputs/2025-11-07/11-41-52"  # SquareNut dino
+    # DIR = "/home/coled/flow-learning/outputs/2025-11-07/11-41-52"  # SquareNut dino
+    DIR = "/home/coled/flow-learning/outputs/2025-11-11/10-27-40"  # 2cam squarenut
 
-    model.load_state_dict(torch.load(f"{DIR}/flow_epoch_100.pth"))
+    model.load_state_dict(torch.load(f"{DIR}/flow_epoch_200.pth"))
     with open(f"{DIR}/normalization_stats.pkl", "rb") as f:
         normalization_stats = pickle.load(f)
     with open(f"{DIR}/action_normalization_stats.pkl", "rb") as f:
@@ -138,7 +143,10 @@ def main(cfg: DictConfig) -> None:
     success = False
     for step in range(1000):
         current_obs = {
-            "images": transform(obs["agentview_image"]).permute(1, 2, 0).numpy(),
+            "images_1": transform(obs["agentview_image"]).permute(1, 2, 0).numpy(),
+            "images_2": transform(obs["robot0_eye_in_hand_image"])
+            .permute(1, 2, 0)
+            .numpy(),
             "joints": np.concatenate(
                 [
                     obs["robot0_joint_pos"],
@@ -158,8 +166,10 @@ def main(cfg: DictConfig) -> None:
             env.render()
         else:
             # NOTE images upside down so flipping...
-            images = np.stack([cv2.flip(h["images"], 0) for h in obs_history])
+            images = np.stack([cv2.flip(h["images_1"], 0) for h in obs_history])
             images = images * 255.0  # to [0, 255] range
+            images2 = np.stack([cv2.flip(h["images_2"], 0) for h in obs_history])
+            images2 = images2 * 255.0  # to [0, 255
             joints = np.stack([h["joints"] for h in obs_history])
             grippers = np.stack([h["gripper"] for h in obs_history])
             # objects = np.stack([h["object"] for h in obs_history])
@@ -168,6 +178,9 @@ def main(cfg: DictConfig) -> None:
                 "obs": {
                     "agentview_image": torch.tensor(
                         images, dtype=torch.float32
+                    ).unsqueeze(0),
+                    "robot0_eye_in_hand_image": torch.tensor(
+                        images2, dtype=torch.float32
                     ).unsqueeze(0),
                     "robot0_joint_pos": torch.tensor(
                         joints, dtype=torch.float32
@@ -197,7 +210,7 @@ def main(cfg: DictConfig) -> None:
             # keypoints = debug["img_kp"].cpu().numpy()
 
             # visualize
-            # img = images[0] * 255
+            # img = images2[0]
             # img = np.ascontiguousarray(img)
             # img = img.astype(np.uint8)
             # print(np.min(img), np.max(img), np.mean(img))
@@ -229,7 +242,6 @@ def main(cfg: DictConfig) -> None:
                 print("Inferred Action:", [round(x, 2) for x in action_i.tolist()])
 
                 action_i = np.clip(action_i, env.action_spec[0], env.action_spec[1])
-                # action_i[3:6] = 0.0  # zero out rotation for simplicity
                 obs, reward, done, info = env.step(action_i)
                 success = env._check_success()
 
